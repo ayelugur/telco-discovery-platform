@@ -1,0 +1,252 @@
+/* ================================================================
+   AUTOSYS JIL - TELCO BILLING BATCH SCHEDULE
+   Environment: PROD
+   Exported: 2024-01-15
+   Owner: Billing Operations Team
+   NOTE: Some jobs added ad-hoc without full JIL documentation.
+         Dependency chain reverse-engineered from BATCH_JOB_CONTROL table.
+   ================================================================ */
+
+/* ── MONTHLY BILLING MASTER BOX ─────────────────────────────── */
+insert_job: BILLING_MONTHLY_MASTER
+job_type: BOX
+owner: billing_svc
+permission: gx, wx
+date_conditions: 1
+days_of_week: 1         /* Runs 1st of each month */
+start_times: "01:00"
+description: "Master box for monthly billing run. DO NOT manually start individual jobs - always start this box."
+alarm_if_fail: 1
+notification_emailaddress: billing-ops@corp.internal;oncall-billing@corp.internal
+
+/* ── STEP 1: CLOSE BILLING PERIOD ───────────────────────────── */
+insert_job: BILL_001_CLOSE_PERIOD
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/close_period.sh $BILLING_MONTH $BILLING_YEAR
+machine: billingprod01.corp.internal
+owner: billing_svc
+permission: gx, wx
+std_out_file: /var/log/billing/BILL_001_CLOSE_PERIOD.%d.log
+std_err_file: /var/log/billing/BILL_001_CLOSE_PERIOD.%d.err
+alarm_if_fail: 1
+max_run_alarm: 60       /* Alert if > 60 minutes */
+description: "Locks usage records for current billing period. Sets RATED_FLAG eligibility window."
+
+/* ── STEP 2a: RATE VOICE CDRs ────────────────────────────────── */
+insert_job: BILL_010_RATE_VOICE
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/bin/rate_engine.sh --type=VOICE --month=$BILLING_MONTH --year=$BILLING_YEAR --threads=8
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_001_CLOSE_PERIOD)
+std_out_file: /var/log/billing/BILL_010_RATE_VOICE.%d.log
+std_err_file: /var/log/billing/BILL_010_RATE_VOICE.%d.err
+alarm_if_fail: 1
+max_run_alarm: 240
+description: "Rates all unrated VOICE_CALL records in USAGE_DETAIL. Applies rate plan logic."
+/* NOTE: --threads=8 was increased from 4 in 2023. DB contention observed at peak. Revert to 4 if deadlock errors seen. */
+
+/* ── STEP 2b: RATE DATA USAGE ────────────────────────────────── */
+insert_job: BILL_011_RATE_DATA
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/bin/rate_engine.sh --type=DATA --month=$BILLING_MONTH --year=$BILLING_YEAR --threads=4
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_001_CLOSE_PERIOD)
+/* NOTE: Should run parallel with BILL_010_RATE_VOICE but sequential after OA-2019-003 incident.
+   Incident: Both jobs simultaneously updating USAGE_DETAIL caused row-level lock escalation.
+   Fix required: Partition USAGE_DETAIL by USAGE_TYPE to allow true parallel rating. */
+std_out_file: /var/log/billing/BILL_011_RATE_DATA.%d.log
+alarm_if_fail: 1
+max_run_alarm: 120
+
+/* ── STEP 2c: RATE ROAMING ───────────────────────────────────── */
+insert_job: BILL_012_RATE_ROAMING  
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/bin/rate_roaming.sh --month=$BILLING_MONTH --partner-files=/data/roaming/incoming/
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_001_CLOSE_PERIOD)
+std_out_file: /var/log/billing/BILL_012_RATE_ROAMING.%d.log
+alarm_if_fail: 0         /* Non-critical - will run with missing partner files */
+max_run_alarm: 45
+description: "Rates roaming CDRs from partner carrier file drops. Files expected by 23:00 prior day via SFTP."
+/* KNOWN ISSUE: Partner files frequently arrive late (Deutsche Telekom, Orange). Job will complete with 
+   WARNING status and partial roaming charges. Finance manually adjusts. No automated retry/reprocess. */
+
+/* ── STEP 3: FILE ARRIVAL WATCHER FOR MEDIATION ─────────────── */
+insert_job: BILL_015_WAIT_MEDIATION_FILES
+job_type: FW                /* File Watcher */
+box_name: BILLING_MONTHLY_MASTER
+watch_file: /data/mediation/CDR_COMPLETE_$BILLING_YEAR$BILLING_MONTH.flag
+condition: success(BILL_001_CLOSE_PERIOD)
+description: "Wait for mediation platform to drop completion flag file. Signals all CDRs for period are available."
+/* If this flag file doesn't appear within 4 hours, batch will hang indefinitely. 
+   Manual intervention: touch /data/mediation/CDR_COMPLETE_YYYYMM.flag  
+   Run oncall runbook: https://confluence.corp.internal/x/bK3mB (last updated 2021) */
+
+/* ── STEP 4: APPLY PROMOTIONS ────────────────────────────────── */
+insert_job: BILL_020_APPLY_PROMOS
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: java -jar /opt/billing/lib/promo-engine-2.4.1.jar --month=$BILLING_MONTH --year=$BILLING_YEAR
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_010_RATE_VOICE) & success(BILL_011_RATE_DATA) & success(BILL_012_RATE_ROAMING)
+std_out_file: /var/log/billing/BILL_020_APPLY_PROMOS.%d.log
+alarm_if_fail: 1
+max_run_alarm: 60
+description: "Applies promotional discounts. Known issue: stacked promos not handled. ~200 manual corrections monthly."
+/* TECH DEBT: promo-engine-2.4.1.jar compiled for Java 8. Server running Java 17 in compat mode.
+   Upgrade to promo-engine-3.x blocked by vendor licensing issue since 2022. */
+
+/* ── STEP 5: GENERATE INVOICES ───────────────────────────────── */
+insert_job: BILL_030_GENERATE_INV
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/oracle/client/bin/sqlplus billing_app/$BILLING_DB_PASS@BILLINGPROD @/opt/billing/sql/run_invoice_gen.sql $BILLING_MONTH $BILLING_YEAR
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_020_APPLY_PROMOS)
+std_out_file: /var/log/billing/BILL_030_GENERATE_INV.%d.log
+alarm_if_fail: 1
+max_run_alarm: 120
+description: "Calls PKG_INVOICE.GENERATE_ALL. Single-threaded PL/SQL. Runtime ~96 min and growing."
+/* PASSWORD NOTE: BILLING_DB_PASS env var set in /etc/billing_env. File permissions 644 - SECURITY RISK.
+   Ticket SEC-2023-0201 opened May 2023. Not yet remediated. */
+
+/* ── STEP 6: TAX CALCULATION ─────────────────────────────────── */
+insert_job: BILL_040_TAX_CALC
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/tax_calc.sh --invoice-batch=$BILLING_YEAR$BILLING_MONTH --engine=AVALARA
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_030_GENERATE_INV)
+alarm_if_fail: 1
+max_run_alarm: 90
+description: "Calls Avalara tax engine API for all invoices. If Avalara unreachable, entire billing run fails."
+/* RISK: No local fallback. Avalara SLA 99.9% = ~8.7 hours downtime/year.
+   Business requirement to implement cached tax table fallback - deprioritized for 3 years running. */
+
+/* ── STEP 7: FINALIZE INVOICES ───────────────────────────────── */
+insert_job: BILL_050_FINALIZE_INV
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/finalize_invoices.sh $BILLING_MONTH $BILLING_YEAR
+machine: billingprod01.corp.internal
+owner: billing_svc  
+condition: success(BILL_040_TAX_CALC)
+alarm_if_fail: 1
+max_run_alarm: 45
+
+/* ── STEPS 8-11: POST-FINALIZATION (parallel fan-out) ────────── */
+
+insert_job: BILL_060_AUTOPAY
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/process_autopay.sh --month=$BILLING_MONTH
+machine: billingprod02.corp.internal   /* Different machine - payment processing isolated */
+owner: billing_svc
+condition: success(BILL_050_FINALIZE_INV)
+alarm_if_fail: 0    /* Payment failures handled by retry job, not batch abort */
+max_run_alarm: 60
+
+insert_job: BILL_070_DUNNING
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/oracle/client/bin/sqlplus billing_app/$BILLING_DB_PASS@BILLINGPROD @/opt/billing/sql/run_dunning.sql
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_050_FINALIZE_INV)
+alarm_if_fail: 1
+max_run_alarm: 30
+
+insert_job: BILL_080_SYNC_CRM
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/oracle/client/bin/sqlplus billing_app/$BILLING_DB_PASS@BILLINGPROD @/opt/billing/sql/sync_crm.sql
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_050_FINALIZE_INV)
+alarm_if_fail: 1
+max_run_alarm: 60
+description: "Syncs invoice/balance data back to Amdocs CRM via BILLINK DB link. Fails ~3x/month."
+
+insert_job: BILL_090_GL_EXPORT
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/gl_export.sh $BILLING_MONTH $BILLING_YEAR /data/finance/outgoing/GL_EXPORT_$BILLING_YEAR$BILLING_MONTH.csv
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_050_FINALIZE_INV)
+alarm_if_fail: 1
+max_run_alarm: 30
+description: "Writes GL export CSV to NFS share. Finance team imports manually into SAP."
+/* Finance notified by email when file ready. Email sent by script - no formal API handoff.
+   If NFS mount unavailable, script exits 0 (bug) - file silently not written. SEC/OPS gap. */
+
+/* ── STEP 12: FINAL RECONCILIATION ──────────────────────────── */
+insert_job: BILL_099_RECONCILE
+job_type: CMD
+box_name: BILLING_MONTHLY_MASTER
+command: /opt/billing/scripts/reconcile.sh --crm-check --nc-check --gl-check --month=$BILLING_MONTH
+machine: billingprod01.corp.internal
+owner: billing_svc
+condition: success(BILL_080_SYNC_CRM) & success(BILL_090_GL_EXPORT)
+alarm_if_fail: 0    /* Reconciliation failures are WARNING only - business accepts 1.2% divergence */
+max_run_alarm: 120
+description: "Validates billing totals vs CRM subscriptions vs Netcracker inventory vs GL. Known 1.2% divergence."
+
+/* ══════════════════════════════════════════════════════════════
+   NIGHTLY MAINTENANCE JOBS (outside monthly box)
+   ══════════════════════════════════════════════════════════════ */
+
+insert_job: NIGHTLY_NC_INVENTORY_SYNC
+job_type: CMD
+command: /opt/billing/scripts/nc_inventory_sync.sh /data/netcracker/incoming/NC_INVENTORY_$(date +\%Y\%m\%d).csv
+machine: billingprod01.corp.internal
+owner: billing_svc
+days_of_week: all
+start_times: "02:30"
+description: "Picks up Netcracker nightly inventory CSV export and loads into TELCO_BILLING staging."
+/* File naming: NC_INVENTORY_YYYYMMDD.csv dropped by Netcracker at ~02:00 via SFTP. 
+   If file late or missing, job completes with WARNING. No alerting to NC team. */
+
+insert_job: NIGHTLY_USAGE_PURGE_CHECK
+job_type: CMD
+command: /opt/billing/scripts/usage_size_check.sh --warn-gb=800 --critical-gb=950 --tablespace=USAGE_TS
+machine: billingprod01.corp.internal
+owner: billing_svc
+days_of_week: all
+start_times: "06:00"
+description: "Monitors USAGE_DETAIL tablespace growth. No actual purge - monitoring only. Purge policy TBD."
+/* RISK: No actual data purge implemented. Monitoring only. Tablespace at 78% capacity as of Jan 2024.
+   At current growth rate (~15GB/month), will reach critical threshold in ~4 months. */
+
+insert_job: WEEKLY_MKTG_SEGMENT_REFRESH
+job_type: CMD
+command: /opt/teradata/bin/bteq < /opt/billing/scripts/segment_refresh.btq
+machine: billingprod01.corp.internal
+owner: mktg_svc
+days_of_week: su
+start_times: "22:00"
+description: "Refreshes CUSTOMER_SEGMENT scores from Teradata model. Weekly only - churn score can be 7 days stale."
+/* Teradata connection config: /etc/teradata/tdlogon.cfg - credentials in plaintext. 
+   Security ticket SEC-2023-0198 open since April 2023. */
+
+insert_job: MONTHLY_REGULATORY_EXPORT
+job_type: CMD
+command: /opt/billing/scripts/regulatory_export.sh --period=$BILLING_MONTH --type=USAGE_SUMMARY --dest=/data/regulatory/
+machine: billingprod01.corp.internal
+owner: compliance_svc
+days_of_week: 1   /* 1st of month */
+start_times: "08:00"
+description: "Regulatory usage reporting export for FCC/state PUC. Calls deprecated NC /v1/inventory/export endpoint."
+/* This job is the BLOCKER preventing retirement of Netcracker /v1/inventory/export endpoint.
+   No one has re-implemented this against v2 API. Compliance team owns this job but has no 
+   engineering resources to update it. Vendor quote to update: $45,000 - not approved. */

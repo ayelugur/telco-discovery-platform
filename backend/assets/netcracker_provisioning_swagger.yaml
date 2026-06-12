@@ -1,0 +1,565 @@
+openapi: "2.0"
+info:
+  title: "Netcracker Provisioning & Resource Management API"
+  version: "3.4.1-SNAPSHOT"
+  description: |
+    Netcracker OSS Provisioning and Resource Inventory API.
+    WARNING: This Swagger was auto-generated from WSDL in 2021. Some endpoints
+    are deprecated and maintained for backward compatibility only. 
+    Do NOT use endpoints marked [DEPRECATED] for new integrations.
+    Contact: netcracker-api@corp.internal (mailbox unmonitored since 2022)
+  contact:
+    name: "Netcracker Platform Team (VACANT - see ticket OPS-4421)"
+    email: "netcracker-api@corp.internal"
+host: "netcracker-api.corp.internal:8443"
+basePath: "/ncs/api"
+schemes:
+  - "https"
+  - "http"
+consumes:
+  - "application/json"
+  - "application/xml"
+produces:
+  - "application/json"
+
+securityDefinitions:
+  basicAuth:
+    type: "basic"
+    description: "Basic auth. Credentials stored in CRM Oracle keystore and Remedy config. Rotation last performed 2019."
+  apiKey:
+    type: "apiKey"
+    in: "header"
+    name: "X-NC-API-Key"
+
+paths:
+
+  # ─── WORK ORDER MANAGEMENT ───────────────────────────────────────────────────
+
+  /v2/workorders:
+    post:
+      tags: ["Work Orders"]
+      summary: "Create Work Order"
+      description: |
+        Creates a provisioning work order. Triggers network activation workflow.
+        Average processing time: 45 seconds for broadband, 4-8 minutes for fiber.
+        Called synchronously by Amdocs CRM SP_SUBMIT_ORDER - known performance bottleneck.
+      operationId: "createWorkOrder"
+      parameters:
+        - in: "body"
+          name: "workOrder"
+          schema:
+            $ref: "#/definitions/WorkOrderRequest"
+      responses:
+        201:
+          description: "Work order created"
+          schema:
+            $ref: "#/definitions/WorkOrderResponse"
+        202:
+          description: "Accepted for async processing - check status via GET /v2/workorders/{id}"
+        400:
+          description: "Validation error"
+        409:
+          description: "Duplicate work order detected (same customer + product + date)"
+        503:
+          description: "Provisioning engine unavailable - occurs during nightly maintenance 02:00-04:00"
+
+  /v2/workorders/{workOrderId}:
+    get:
+      tags: ["Work Orders"]
+      summary: "Get Work Order Status"
+      operationId: "getWorkOrder"
+      parameters:
+        - name: "workOrderId"
+          in: "path"
+          required: true
+          type: "string"
+      responses:
+        200:
+          description: "Work order details"
+          schema:
+            $ref: "#/definitions/WorkOrderDetail"
+        404:
+          description: "Not found. Note: work orders purged after 90 days."
+
+    patch:
+      tags: ["Work Orders"]
+      summary: "Update Work Order"
+      description: "Partial update. Only STATUS and PRIORITY fields are patchable after creation."
+      operationId: "updateWorkOrder"
+      parameters:
+        - name: "workOrderId"
+          in: "path"
+          required: true
+          type: "string"
+        - in: "body"
+          name: "update"
+          schema:
+            type: "object"
+            properties:
+              status:
+                type: "string"
+                enum: ["CANCELLED", "ON_HOLD", "EXPEDITE"]
+              priority:
+                type: "integer"
+      responses:
+        200:
+          description: "Updated"
+        409:
+          description: "Cannot update - work order already in terminal state"
+
+  /v1/workorders:
+    post:
+      tags: ["Work Orders - DEPRECATED"]
+      summary: "[DEPRECATED] Create Work Order v1"
+      description: |
+        DEPRECATED. Use /v2/workorders instead.
+        Still called by: Remedy ITSM integration, HP TeMIP fault workflow, legacy IVR.
+        Scheduled for removal Q2 2023 (not yet removed as of this export).
+      operationId: "createWorkOrderV1"
+      parameters:
+        - in: "body"
+          name: "body"
+          schema:
+            type: "object"
+            description: "Legacy XML-mapped JSON. Field names are SOAP artifact names."
+            properties:
+              custId: {type: "string"}
+              prodCd: {type: "string"}
+              actnCd: {type: "string", description: "A=Activate, D=Deactivate, M=Modify"}
+              reqDt: {type: "string", description: "YYYYMMDD format (not ISO 8601)"}
+              prtyFlg: {type: "string", description: "Y/N flag. Maps to priority 1 if Y."}
+      responses:
+        200:
+          description: "Always returns 200 even on error. Check responseCode field in body."
+
+  # ─── RESOURCE INVENTORY ──────────────────────────────────────────────────────
+
+  /v2/resources:
+    get:
+      tags: ["Resource Inventory"]
+      summary: "Query Resource Inventory"
+      description: |
+        Returns network resources (ports, circuits, CPE, IP blocks).
+        This is the authoritative source for physical resource assignments.
+        Amdocs CRM and Oracle Billing both maintain denormalized copies - reconciliation
+        runs nightly but diverges ~1.2% of records.
+      operationId: "getResources"
+      parameters:
+        - name: "customerId"
+          in: "query"
+          type: "string"
+          description: "Amdocs CUST_ID (numeric string)"
+        - name: "serviceId"
+          in: "query"
+          type: "string"
+        - name: "resourceType"
+          in: "query"
+          type: "string"
+          enum: ["PORT", "CIRCUIT", "CPE_DEVICE", "IP_BLOCK", "VLAN", "FIBER_PAIR", "WAVELENGTH"]
+        - name: "status"
+          in: "query"
+          type: "string"
+          enum: ["ACTIVE", "RESERVED", "AVAILABLE", "FAULTY", "DECOMMISSIONED", "UNKNOWN"]
+        - name: "region"
+          in: "query"
+          type: "string"
+          description: "Network region code. No standard list - values are free-text from field ops."
+        - name: "pageSize"
+          in: "query"
+          type: "integer"
+          default: 100
+          maximum: 500
+          description: "Max 500. Larger queries require BULK export endpoint."
+        - name: "pageToken"
+          in: "query"
+          type: "string"
+      responses:
+        200:
+          description: "Resource list"
+          schema:
+            $ref: "#/definitions/ResourceList"
+        206:
+          description: "Partial content - more pages available"
+
+  /v2/resources/{resourceId}:
+    get:
+      tags: ["Resource Inventory"]
+      summary: "Get Resource Detail"
+      operationId: "getResource"
+      parameters:
+        - name: "resourceId"
+          in: "path"
+          required: true
+          type: "string"
+      responses:
+        200:
+          description: "Resource detail with full topology"
+          schema:
+            $ref: "#/definitions/ResourceDetail"
+
+  /v2/resources/{resourceId}/topology:
+    get:
+      tags: ["Resource Inventory"]
+      summary: "Get Resource Topology"
+      description: "Returns upstream/downstream network topology for a resource. Used by assurance for impact analysis."
+      operationId: "getResourceTopology"
+      parameters:
+        - name: "resourceId"
+          in: "path"
+          required: true
+          type: "string"
+        - name: "depth"
+          in: "query"
+          type: "integer"
+          default: 2
+          maximum: 5
+          description: "Topology traversal depth. Depth > 3 can time out on large networks."
+      responses:
+        200:
+          description: "Topology graph"
+          schema:
+            $ref: "#/definitions/TopologyGraph"
+        504:
+          description: "Timeout on deep topology queries for core network nodes"
+
+  /v1/inventory/export:
+    get:
+      tags: ["Resource Inventory - DEPRECATED"]
+      summary: "[DEPRECATED] Bulk inventory export"
+      description: |
+        DEPRECATED. Returns full inventory as CSV. 
+        Still consumed by: Oracle Billing reconciliation batch, HP TeMIP inventory sync,
+        external regulatory reporting job (runs monthly).
+        No replacement endpoint exists yet - removal blocked.
+      operationId: "exportInventoryCSV"
+      produces:
+        - "text/csv"
+      responses:
+        200:
+          description: "CSV dump. Schema undocumented - inferred from field headers."
+
+  # ─── SERVICE ACTIVATION ──────────────────────────────────────────────────────
+
+  /v2/activations:
+    post:
+      tags: ["Service Activation"]
+      summary: "Trigger Service Activation"
+      description: |
+        Orchestrates end-to-end service activation across:
+        1. Resource reservation
+        2. Network device configuration (via NETCONF/YANG to routers)
+        3. IP provisioning (DHCP/RADIUS)
+        4. CPE configuration push (TR-069)
+        5. Activation confirmation back to CRM
+        
+        This is a long-running async operation. Poll /v2/activations/{id}/status.
+        Average completion: 8 minutes broadband, 45 minutes fiber, 4 hours enterprise circuit.
+      operationId: "triggerActivation"
+      parameters:
+        - in: "body"
+          name: "request"
+          schema:
+            $ref: "#/definitions/ActivationRequest"
+      responses:
+        202:
+          description: "Activation started. Returns activation tracking ID."
+          schema:
+            type: "object"
+            properties:
+              activationId: {type: "string"}
+              estimatedCompletionMinutes: {type: "integer"}
+              trackingUrl: {type: "string"}
+
+  /v2/activations/{activationId}/status:
+    get:
+      tags: ["Service Activation"]
+      summary: "Get Activation Status"
+      operationId: "getActivationStatus"
+      parameters:
+        - name: "activationId"
+          in: "path"
+          required: true
+          type: "string"
+      responses:
+        200:
+          description: "Activation status"
+          schema:
+            $ref: "#/definitions/ActivationStatus"
+
+  /v2/activations/{activationId}/rollback:
+    post:
+      tags: ["Service Activation"]
+      summary: "Rollback Activation"
+      description: |
+        Initiates rollback of a failed or unwanted activation.
+        WARNING: Rollback is not always fully reversible for fiber activations
+        where physical splicing has occurred. Manual field intervention may be required.
+      operationId: "rollbackActivation"
+      parameters:
+        - name: "activationId"
+          in: "path"
+          required: true
+          type: "string"
+      responses:
+        202:
+          description: "Rollback initiated"
+        409:
+          description: "Cannot rollback - activation in non-reversible state"
+
+  # ─── SERVICE ASSURANCE ────────────────────────────────────────────────────────
+
+  /v2/services/{serviceId}/health:
+    get:
+      tags: ["Service Assurance"]
+      summary: "Get Service Health"
+      description: "Real-time service health. Pulls from HP TeMIP fault management via internal integration."
+      operationId: "getServiceHealth"
+      parameters:
+        - name: "serviceId"
+          in: "path"
+          required: true
+          type: "string"
+      responses:
+        200:
+          description: "Service health"
+          schema:
+            $ref: "#/definitions/ServiceHealth"
+        503:
+          description: "HP TeMIP integration unavailable"
+
+  /v2/services/{serviceId}/alarms:
+    get:
+      tags: ["Service Assurance"]
+      summary: "Get Active Alarms for Service"
+      description: "Active network alarms affecting this service. Source: HP TeMIP via polling (5-min lag)."
+      operationId: "getServiceAlarms"
+      parameters:
+        - name: "serviceId"
+          in: "path"
+          required: true
+          type: "string"
+        - name: "severity"
+          in: "query"
+          type: "string"
+          enum: ["CRITICAL", "MAJOR", "MINOR", "WARNING"]
+      responses:
+        200:
+          description: "Active alarms list"
+
+definitions:
+
+  WorkOrderRequest:
+    type: "object"
+    required: ["customerId", "productCode", "actionType", "requestedDate"]
+    properties:
+      customerId:
+        type: "string"
+        description: "Amdocs CUST_ID"
+      productCode:
+        type: "string"
+        description: "Must match product catalog in Oracle Billing"
+      actionType:
+        type: "string"
+        enum: ["ACTIVATE", "DEACTIVATE", "MODIFY", "SUSPEND", "RESUME", "PORT_IN", "PORT_OUT"]
+      requestedDate:
+        type: "string"
+        format: "date-time"
+      serviceAddress:
+        $ref: "#/definitions/ServiceAddress"
+      attributes:
+        type: "object"
+        description: "Product-specific attributes. Schema varies by productCode - not documented here. See product catalog."
+        additionalProperties: true
+      correlationId:
+        type: "string"
+        description: "Amdocs ORDER_ID for cross-system tracing. Optional but required for fallout investigation."
+
+  WorkOrderResponse:
+    type: "object"
+    properties:
+      workOrderId:
+        type: "string"
+      status:
+        type: "string"
+        enum: ["CREATED", "QUEUED", "IN_PROGRESS", "COMPLETED", "FAILED", "CANCELLED"]
+      createdAt:
+        type: "string"
+        format: "date-time"
+      estimatedCompletionMinutes:
+        type: "integer"
+
+  WorkOrderDetail:
+    allOf:
+      - $ref: "#/definitions/WorkOrderResponse"
+      - type: "object"
+        properties:
+          steps:
+            type: "array"
+            items:
+              type: "object"
+              properties:
+                stepName: {type: "string"}
+                status: {type: "string"}
+                startedAt: {type: "string", format: "date-time"}
+                completedAt: {type: "string", format: "date-time"}
+                errorMessage: {type: "string"}
+          resourcesAssigned:
+            type: "array"
+            items:
+              type: "string"
+              description: "Resource IDs assigned during this work order"
+          auditLog:
+            type: "array"
+            items:
+              type: "object"
+              properties:
+                timestamp: {type: "string"}
+                actor: {type: "string"}
+                action: {type: "string"}
+                note: {type: "string"}
+
+  ResourceList:
+    type: "object"
+    properties:
+      resources:
+        type: "array"
+        items:
+          $ref: "#/definitions/ResourceSummary"
+      totalCount:
+        type: "integer"
+      nextPageToken:
+        type: "string"
+
+  ResourceSummary:
+    type: "object"
+    properties:
+      resourceId: {type: "string"}
+      resourceType: {type: "string"}
+      status: {type: "string"}
+      customerId: {type: "string", description: "NULL if unassigned or unknown - see known issue NC-8821"}
+      serviceId: {type: "string"}
+      location: {type: "string"}
+      lastUpdated: {type: "string", format: "date-time"}
+
+  ResourceDetail:
+    allOf:
+      - $ref: "#/definitions/ResourceSummary"
+      - type: "object"
+        properties:
+          technicalAttributes:
+            type: "object"
+            additionalProperties: true
+            description: "Varies heavily by resource type. No schema enforcement."
+          parentResourceId:
+            type: "string"
+            description: "Parent resource in hierarchy (e.g., port belongs to shelf belongs to rack)"
+          childResourceIds:
+            type: "array"
+            items:
+              type: "string"
+          assignedWorkOrders:
+            type: "array"
+            items:
+              type: "string"
+
+  TopologyGraph:
+    type: "object"
+    properties:
+      rootResourceId: {type: "string"}
+      nodes:
+        type: "array"
+        items:
+          type: "object"
+          properties:
+            id: {type: "string"}
+            type: {type: "string"}
+            label: {type: "string"}
+            status: {type: "string"}
+      edges:
+        type: "array"
+        items:
+          type: "object"
+          properties:
+            from: {type: "string"}
+            to: {type: "string"}
+            linkType: {type: "string"}
+            capacity: {type: "string"}
+
+  ActivationRequest:
+    type: "object"
+    required: ["workOrderId", "customerId", "serviceType"]
+    properties:
+      workOrderId: {type: "string"}
+      customerId: {type: "string"}
+      serviceType:
+        type: "string"
+        enum: ["BROADBAND", "FIBER", "VOIP", "MOBILE", "ENTERPRISE_CIRCUIT", "IPTV", "SD_WAN"]
+      resourcePreferences:
+        type: "object"
+        description: "Preferred resource pool/region. Best-effort only."
+      activationParameters:
+        type: "object"
+        additionalProperties: true
+        description: "Service-type specific. No consolidated schema. See runbook NC-ACT-001 through NC-ACT-019."
+
+  ActivationStatus:
+    type: "object"
+    properties:
+      activationId: {type: "string"}
+      status:
+        type: "string"
+        enum: ["QUEUED", "RESOURCE_RESERVATION", "NETWORK_CONFIG", "IP_PROVISIONING", "CPE_CONFIG", "VALIDATION", "COMPLETED", "FAILED", "ROLLING_BACK", "ROLLED_BACK"]
+      percentComplete: {type: "integer"}
+      currentStep: {type: "string"}
+      failureReason: {type: "string"}
+      resourcesProvisioned:
+        type: "array"
+        items:
+          type: "string"
+
+  ServiceHealth:
+    type: "object"
+    properties:
+      serviceId: {type: "string"}
+      overallHealth:
+        type: "string"
+        enum: ["HEALTHY", "DEGRADED", "DOWN", "UNKNOWN"]
+      uptime99DayPct: {type: "number"}
+      activeAlarmCount: {type: "integer"}
+      lastIncidentDate: {type: "string", format: "date"}
+      meanTimeToRestoreHours: {type: "number"}
+
+  ServiceAddress:
+    type: "object"
+    properties:
+      addressLine1: {type: "string"}
+      addressLine2: {type: "string"}
+      city: {type: "string"}
+      state: {type: "string"}
+      zip: {type: "string"}
+      geocode: {type: "string", description: "Internal geocode. Required for fiber serviceability check."}
+      buildingId: {type: "string", description: "MDU building identifier. Required for apartment addresses."}
+
+x-known-issues:
+  - id: "NC-8821"
+    description: "~3,400 resources have NULL customerId due to migration script error in 2020. Not remediated."
+  - id: "NC-9102"
+    description: "v1 endpoints returning 200 on error causes silent failures in consuming systems"
+  - id: "NC-9445"
+    description: "Topology API times out for 12% of core network nodes - affects impact analysis accuracy"
+  - id: "NC-9891"
+    description: "Work order purge at 90 days breaks historical correlation with Amdocs order audit table"
+
+x-integration-consumers:
+  - system: "Amdocs CRM"
+    endpoints: ["/v2/workorders (POST)", "/v2/resources (GET)", "/v2/services/{id}/health"]
+    integration_type: "Synchronous REST + legacy SOAP"
+  - system: "Oracle Billing"
+    endpoints: ["/v1/inventory/export", "/v2/resources (GET)"]
+    integration_type: "Batch file + DB query"
+  - system: "HP TeMIP"
+    endpoints: ["/v2/activations", "/v2/services/{id}/alarms"]
+    integration_type: "Event-driven (proprietary protocol)"
+  - system: "Remedy ITSM"
+    endpoints: ["/v1/workorders", "/v2/workorders/{id}"]
+    integration_type: "REST polling (every 5 minutes)"
