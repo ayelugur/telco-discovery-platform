@@ -1,21 +1,17 @@
-FROM python:3.12-slim
+FROM python:3.12.3-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
+RUN pip install --upgrade pip
 
-# Copy and install requirements first (layer caching)
+# Install pydantic-core from pre-built wheel first, explicitly
+RUN pip install --only-binary=:all: pydantic-core==2.16.3
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --only-binary=:all: -r requirements.txt
 
-# Copy application code
 COPY . .
 
-# Expose port
 EXPOSE 8000
 
-# Start server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
