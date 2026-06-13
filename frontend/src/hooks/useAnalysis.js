@@ -4,21 +4,24 @@ import { api } from '../lib/api'
 const AGENTS = ['discovery', 'risk', 'ai_opportunities', 'roadmap']
 
 const AGENT_LABELS = {
-  discovery: 'Discovery & Dependency Mapping',
-  risk: 'Risk & Architecture Analysis',
+  discovery:        'Discovery & Dependency Mapping',
+  risk:             'Risk & Architecture Analysis',
   ai_opportunities: 'AI Opportunity Identification',
-  roadmap: 'Migration Roadmap Generation',
+  roadmap:          'Migration Roadmap Generation',
 }
 
 export function useAnalysis() {
   const [assets, setAssets] = useState([])
-  const [agentStatus, setAgentStatus] = useState({}) // idle | running | done | error
-  const [agentLogs, setAgentLogs] = useState({})     // agent -> text chunks
-  const [results, setResults] = useState({})          // agent -> parsed data
+  const [agentStatus, setAgentStatus] = useState({})
+  const [agentLogs, setAgentLogs] = useState({})
+  const [results, setResults] = useState({})
   const [isRunning, setIsRunning] = useState(false)
   const [isComplete, setIsComplete] = useState(false)
   const [activeAgent, setActiveAgent] = useState(null)
   const closeStream = useRef(null)
+
+  // Track which tabs have EVER had results — persists across tab switches
+  const unlockedTabs = useRef(new Set())
 
   const loadAssets = useCallback(async () => {
     const data = await api.getAssets()
@@ -44,6 +47,7 @@ export function useAnalysis() {
     setIsRunning(false)
     setIsComplete(false)
     setActiveAgent(null)
+    unlockedTabs.current = new Set()
     await loadAssets()
   }, [loadAssets])
 
@@ -63,9 +67,14 @@ export function useAnalysis() {
         setAgentLogs(l => ({ ...l, [agent]: '' }))
       },
       onChunk: (agent, text) => {
-        setAgentLogs(l => ({ ...l, [agent]: (l[agent] || '') + text }))
+        setAgentLogs(l => ({ ...l, [agent]: text }))
       },
       onResult: (agent, data) => {
+        console.log(`[useAnalysis] storing result for agent: ${agent}`, Object.keys(data))
+        // Mark corresponding tab as permanently unlocked
+        const tabMap = { discovery: ['graph', 'appmap'], risk: ['risk'], roadmap: ['roadmap'] }
+        const tabs = tabMap[agent] || []
+        tabs.forEach(t => unlockedTabs.current.add(t))
         setResults(r => ({ ...r, [agent]: data }))
       },
       onAgentDone: (agent) => {
@@ -83,11 +92,17 @@ export function useAnalysis() {
     })
   }, [isRunning])
 
+  // A tab is unlocked if it was ever unlocked (uses ref to survive re-renders)
+  const isTabUnlocked = useCallback((tabId) => {
+    if (tabId === 'console') return true
+    return unlockedTabs.current.has(tabId)
+  }, [])
+
   return {
     assets, loadAssets, uploadAsset, removeAsset,
     agentStatus, agentLogs, results,
     isRunning, isComplete, activeAgent,
-    runAnalysis, reset,
+    runAnalysis, reset, isTabUnlocked,
     AGENTS, AGENT_LABELS,
   }
 }

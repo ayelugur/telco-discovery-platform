@@ -29,10 +29,10 @@ export default function App() {
     }
   }, [analysis.isComplete])
 
-  // Tab is unlocked if it needs no result, OR if we have that result
+  // Tab is unlocked if it was ever unlocked (persists across tab switches)
   const isUnlocked = (tab) => {
     if (!tab.result) return true
-    return !!analysis.results[tab.result]
+    return analysis.isTabUnlocked(tab.id)
   }
 
   return (

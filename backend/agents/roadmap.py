@@ -5,49 +5,47 @@ from models import ParsedAsset, DiscoveryOutput, RiskOutput, AIOpportunityOutput
 
 client = anthropic.AsyncAnthropic()
 
-SYSTEM_PROMPT = """You are a principal delivery architect with 20+ years leading OSS/BSS modernization for Tier 1 telcos.
+SYSTEM_PROMPT = """You are a principal delivery architect for OSS/BSS modernization programs.
 
-Return ONLY valid JSON:
-{
-  "waves": [{"wave_number": 1, "name": "name", "domains": ["list"], "systems": ["list"], "duration_months": 6, "effort_person_months": 24, "cost_range_usd": "$2M-$3M", "team_size": 8, "team_composition": ["2x Architects"], "key_milestones": ["milestone"], "dependencies": ["dep"], "risks": ["risk"], "ai_opportunities": ["AI-001"]}],
-  "total_duration_months": 18,
-  "total_cost_range_usd": "$8M-$12M",
-  "target_architecture": "description mentioning Kafka, microservices, API gateway, cloud-native",
-  "quick_wins": ["4-5 items in 90 days"],
-  "summary": "3-4 sentences"
-}
+Return ONLY compact JSON — no whitespace, no newlines, no markdown.
 
-Wave sequencing: Wave 1=Inventory (lowest deps), Wave 2=Provisioning (decouple Netcracker), Wave 3=Billing+CRM (highest risk, last)."""
+{"waves":[{"wave_number":1,"name":"Foundation & Inventory","domains":["Inventory"],"systems":["Netcracker Inventory"],"duration_months":6,"effort_person_months":24,"cost_range_usd":"$2M-$3M","team_size":8,"team_composition":["2x Integration Architects","3x Backend Engineers","2x QA","1x PM"],"key_milestones":["API gateway live","Inventory microservice deployed","Legacy decommissioned"],"dependencies":["Cloud infrastructure provisioned"],"risks":["Data migration complexity"],"ai_opportunities":["AI-001"]}],"total_duration_months":18,"total_cost_range_usd":"$8M-$12M","target_architecture":"Event-driven microservices on cloud-native platform using Kafka for async integration, replacing synchronous DB links and SOAP calls.","quick_wins":["Deploy API gateway","Add Redis caching for Customer360","Implement circuit breaker on Netcracker SOAP calls"],"summary":"Two sentence summary."}
+
+Rules:
+- Exactly 3 waves
+- Wave 1=Inventory (lowest deps), Wave 2=Provisioning, Wave 3=Billing+CRM (highest risk)
+- Keep milestones to 3 per wave, team_composition to 4 roles max
+- Compact JSON only — no pretty printing"""
 
 
 def build_prompt(assets, discovery, risk, ai_opps):
     ctx = []
     if discovery:
+        ctx.append(f"DOMAINS: {', '.join(d['name'] + '(health=' + str(d.get('health_score','?')) + ')' for d in discovery.domains)}")
         ctx.append(f"DISCOVERY: {discovery.summary}")
     if risk:
         critical = [r for r in risk.risk_items if r.severity == "critical"]
-        ctx.append(f"RISK SCORE: {risk.overall_risk_score}/100")
-        ctx.append("CRITICAL: " + "; ".join(f"{r.title}" for r in critical[:4]))
+        ctx.append(f"RISK SCORE: {risk.overall_risk_score}/100. CRITICAL: {'; '.join(r.title for r in critical[:3])}")
     if ai_opps:
-        ctx.append("AI OPPS: " + ", ".join(f"{o.id} Wave{o.wave} {o.title}" for o in ai_opps.opportunities[:8]))
-    return f"Generate migration roadmap JSON.\n\n{chr(10).join(ctx)}\n\nReturn ONLY JSON."
+        ctx.append("AI OPPS: " + ", ".join(f"{o.id} W{o.wave} {o.title}" for o in ai_opps.opportunities[:6]))
+    return "Generate 3-wave migration roadmap. Return compact JSON only.\n\n" + "\n".join(ctx)
 
 
 async def run_roadmap_agent(assets, discovery, risk, ai_opps):
     prompt = build_prompt(assets, discovery, risk, ai_opps)
-    print(f"[roadmap] Starting Claude API call")
+    print(f"[roadmap] prompt={len(prompt)} chars")
     try:
         response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=8096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )
         full_response = response.content[0].text
-        print(f"[roadmap] Got response, length={len(full_response)}")
-        yield {"type": "chunk", "text": full_response}
+        print(f"[roadmap] response={len(full_response)} chars")
+        yield {"type": "chunk", "text": "Generating phased migration wave plan..."}
     except Exception as e:
-        print(f"[roadmap] Claude API error: {e}")
+        print(f"[roadmap] API error: {e}")
         yield {"type": "error", "message": f"Claude API error: {e}"}
         return
 
@@ -68,5 +66,5 @@ async def run_roadmap_agent(assets, discovery, risk, ai_opps):
         )
         yield {"type": "result", "data": result.model_dump()}
     except Exception as e:
-        print(f"[roadmap] Parse error: {e}")
+        print(f"[roadmap] parse error: {e}\nraw[:300]: {full_response[:300]}")
         yield {"type": "error", "message": f"Parse error: {e}"}
