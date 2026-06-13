@@ -5,65 +5,44 @@ from models import ParsedAsset, DiscoveryOutput, RiskOutput, RiskItem
 
 client = anthropic.AsyncAnthropic()
 
-SYSTEM_PROMPT = """You are a principal architect and security consultant specializing in legacy telecom modernization risk assessment.
-You have deep expertise in OSS/BSS architecture, PCI-DSS, GDPR, and enterprise integration patterns.
+SYSTEM_PROMPT = """You are a principal architect specializing in telecom modernization risk assessment.
 
-You must return ONLY valid JSON — no markdown, no explanation, no preamble.
-
+Return ONLY valid JSON:
 {
-  "risk_items": [
-    {
-      "id": "RISK-001",
-      "system": "system name",
-      "category": "Circular Dependency | Data Ownership | API Coverage | Batch Risk | Security | Compliance | Performance | Data Quality",
-      "title": "short risk title",
-      "description": "detailed description with specific evidence from the assets",
-      "severity": "low | medium | high | critical",
-      "impact": "business impact if not addressed",
-      "recommendation": "specific remediation recommendation"
-    }
-  ],
-  "heatmap": [
-    {
-      "system": "system name",
-      "category": "risk category",
-      "score": 0,
-      "label": "short label",
-      "risk_ids": ["RISK-001"]
-    }
-  ],
+  "risk_items": [{"id": "RISK-001", "system": "name", "category": "Circular Dependency|Data Ownership|API Coverage|Batch Risk|Security|Compliance|Performance|Data Quality", "title": "title", "description": "detail", "severity": "low|medium|high|critical", "impact": "business impact", "recommendation": "fix"}],
+  "heatmap": [{"system": "name", "category": "category", "score": 0, "label": "label", "risk_ids": ["RISK-001"]}],
   "overall_risk_score": 0,
-  "summary": "3-4 sentence executive summary"
+  "summary": "3-4 sentences"
 }
 
-Heatmap systems: ["Amdocs CRM", "Netcracker", "Oracle Billing", "Batch/JIL", "Integrations"]
-Heatmap categories: ["Circular Dependency", "Data Ownership", "API Coverage", "Batch Risk", "Security", "Compliance", "Performance", "Data Quality"]
-Score: 0=no risk, 10=critical. overall_risk_score: 0-100."""
+Systems: Amdocs CRM, Netcracker, Oracle Billing, Batch/JIL, Integrations
+Categories: Circular Dependency, Data Ownership, API Coverage, Batch Risk, Security, Compliance, Performance, Data Quality
+Score 0-10 per cell, overall_risk_score 0-100."""
 
 
 def build_prompt(assets, discovery):
-    blocks = [f"=== {a.filename} ({a.asset_type}) ===\n{a.raw_summary}\n" for a in assets]
-    discovery_block = f"\nDISCOVERY SUMMARY:\n{discovery.summary}\n" if discovery else ""
-    return f"""Analyze these assets and produce a comprehensive risk assessment JSON.
-
-{"".join(blocks)}{discovery_block}
-
-Return ONLY the JSON object. No markdown, no explanation."""
+    blocks = [f"=== {a.filename} ===\n{a.raw_summary}\n" for a in assets]
+    disc = f"\nDISCOVERY: {discovery.summary}" if discovery else ""
+    return f"Produce risk assessment JSON for this telco environment.\n\n{''.join(blocks)}{disc}\n\nReturn ONLY JSON."
 
 
-async def run_risk_agent(assets: list[ParsedAsset], discovery: DiscoveryOutput | None):
+async def run_risk_agent(assets, discovery):
     prompt = build_prompt(assets, discovery)
-    full_response = ""
-
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        async for text in stream.text_stream:
-            full_response += text
-            yield {"type": "chunk", "text": text}
+    print(f"[risk] Starting Claude API call")
+    try:
+        response = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        full_response = response.content[0].text
+        print(f"[risk] Got response, length={len(full_response)}")
+        yield {"type": "chunk", "text": full_response}
+    except Exception as e:
+        print(f"[risk] Claude API error: {e}")
+        yield {"type": "error", "message": f"Claude API error: {e}"}
+        return
 
     try:
         clean = full_response.strip()
@@ -80,4 +59,5 @@ async def run_risk_agent(assets: list[ParsedAsset], discovery: DiscoveryOutput |
         )
         yield {"type": "result", "data": result.model_dump()}
     except Exception as e:
-        yield {"type": "error", "message": f"Failed to parse risk output: {e}", "raw": full_response[:500]}
+        print(f"[risk] Parse error: {e}")
+        yield {"type": "error", "message": f"Parse error: {e}"}

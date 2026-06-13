@@ -5,74 +5,51 @@ from models import ParsedAsset, DiscoveryOutput, RiskOutput, AIOpportunityOutput
 
 client = anthropic.AsyncAnthropic()
 
-SYSTEM_PROMPT = """You are a principal delivery architect with 20+ years leading OSS/BSS modernization programs for Tier 1 telcos.
+SYSTEM_PROMPT = """You are a principal delivery architect with 20+ years leading OSS/BSS modernization for Tier 1 telcos.
 
-You must return ONLY valid JSON — no markdown, no explanation, no preamble.
-
+Return ONLY valid JSON:
 {
-  "waves": [
-    {
-      "wave_number": 1,
-      "name": "wave name",
-      "domains": ["domains addressed"],
-      "systems": ["legacy systems"],
-      "duration_months": 6,
-      "effort_person_months": 24,
-      "cost_range_usd": "$2M - $3M",
-      "team_size": 8,
-      "team_composition": ["2x Integration Architects", "3x Backend Engineers"],
-      "key_milestones": ["milestone 1", "milestone 2"],
-      "dependencies": ["what must be true first"],
-      "risks": ["top 2-3 risks"],
-      "ai_opportunities": ["AI-001"]
-    }
-  ],
+  "waves": [{"wave_number": 1, "name": "name", "domains": ["list"], "systems": ["list"], "duration_months": 6, "effort_person_months": 24, "cost_range_usd": "$2M-$3M", "team_size": 8, "team_composition": ["2x Architects"], "key_milestones": ["milestone"], "dependencies": ["dep"], "risks": ["risk"], "ai_opportunities": ["AI-001"]}],
   "total_duration_months": 18,
-  "total_cost_range_usd": "$8M - $12M",
-  "target_architecture": "description of target state",
-  "quick_wins": ["4-5 items achievable in 90 days"],
-  "summary": "3-4 sentence executive summary"
+  "total_cost_range_usd": "$8M-$12M",
+  "target_architecture": "description mentioning Kafka, microservices, API gateway, cloud-native",
+  "quick_wins": ["4-5 items in 90 days"],
+  "summary": "3-4 sentences"
 }
 
-Sequencing rules:
-- Wave 1: lowest dependency — typically Inventory
-- Wave 2: Provisioning, decouple Netcracker, move to async/event-driven
-- Wave 3: Billing and CRM last — circular dependency must be resolved first
-- Target architecture must mention: Kafka, microservices, API gateway, cloud-native"""
+Wave sequencing: Wave 1=Inventory (lowest deps), Wave 2=Provisioning (decouple Netcracker), Wave 3=Billing+CRM (highest risk, last)."""
 
 
 def build_prompt(assets, discovery, risk, ai_opps):
     ctx = []
     if discovery:
         ctx.append(f"DISCOVERY: {discovery.summary}")
-        ctx.append("DOMAINS: " + ", ".join(f"{d['name']} (health={d.get('health_score','?')})" for d in discovery.domains))
     if risk:
         critical = [r for r in risk.risk_items if r.severity == "critical"]
-        ctx.append(f"RISK SCORE: {risk.overall_risk_score}/100. CRITICAL RISKS: " +
-                   "; ".join(f"{r.title} → {r.recommendation}" for r in critical[:4]))
+        ctx.append(f"RISK SCORE: {risk.overall_risk_score}/100")
+        ctx.append("CRITICAL: " + "; ".join(f"{r.title}" for r in critical[:4]))
     if ai_opps:
-        ctx.append("AI OPPS: " + ", ".join(f"{o.id} Wave{o.wave} {o.title}" for o in ai_opps.opportunities))
-
-    return f"""Synthesize this analysis into a phased migration roadmap.
-
-{chr(10).join(ctx)}
-
-Return ONLY the JSON object. No markdown, no explanation."""
+        ctx.append("AI OPPS: " + ", ".join(f"{o.id} Wave{o.wave} {o.title}" for o in ai_opps.opportunities[:8]))
+    return f"Generate migration roadmap JSON.\n\n{chr(10).join(ctx)}\n\nReturn ONLY JSON."
 
 
 async def run_roadmap_agent(assets, discovery, risk, ai_opps):
     prompt = build_prompt(assets, discovery, risk, ai_opps)
-    full_response = ""
-
-    async with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": prompt}]
-    ) as stream:
-        async for text in stream.text_stream:
-            full_response += text
-            yield {"type": "chunk", "text": text}
+    print(f"[roadmap] Starting Claude API call")
+    try:
+        response = await client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        full_response = response.content[0].text
+        print(f"[roadmap] Got response, length={len(full_response)}")
+        yield {"type": "chunk", "text": full_response}
+    except Exception as e:
+        print(f"[roadmap] Claude API error: {e}")
+        yield {"type": "error", "message": f"Claude API error: {e}"}
+        return
 
     try:
         clean = full_response.strip()
@@ -91,4 +68,5 @@ async def run_roadmap_agent(assets, discovery, risk, ai_opps):
         )
         yield {"type": "result", "data": result.model_dump()}
     except Exception as e:
-        yield {"type": "error", "message": f"Failed to parse roadmap: {e}", "raw": full_response[:500]}
+        print(f"[roadmap] Parse error: {e}")
+        yield {"type": "error", "message": f"Parse error: {e}"}
