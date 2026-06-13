@@ -39,7 +39,7 @@ async def run_roadmap_agent(assets, discovery, risk, ai_opps):
     try:
         response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )

@@ -30,7 +30,7 @@ async def run_ai_opportunities_agent(assets, discovery, risk):
     try:
         response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )

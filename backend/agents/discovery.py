@@ -36,7 +36,7 @@ async def run_discovery_agent(assets: list[ParsedAsset]):
         # Use non-streaming first to confirm API works, then we'll add streaming back
         response = await client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
+            max_tokens=4096,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}]
         )

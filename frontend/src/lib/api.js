@@ -33,15 +33,12 @@ export const api = {
 
     const run = async () => {
       try {
-        // Use fetch instead of EventSource — gives us full control over
-        // headers, timeouts, and streaming, and works reliably through Railway
         const response = await fetch(`${BASE}/api/analyze/full`, {
           method: 'GET',
           headers: {
             'Accept': 'text/event-stream',
             'Cache-Control': 'no-cache',
           },
-          // No timeout — analysis can take 2-3 minutes
         })
 
         if (!response.ok) {
@@ -61,48 +58,65 @@ export const api = {
 
           buffer += decoder.decode(value, { stream: true })
 
-          // SSE messages are separated by double newlines
+          // Split on double newlines (SSE message separator)
           const messages = buffer.split('\n\n')
-          buffer = messages.pop() // last item may be incomplete
+          buffer = messages.pop() // keep incomplete last chunk
 
           for (const message of messages) {
             const trimmed = message.trim()
-            if (!trimmed || trimmed.startsWith(':')) continue // skip keepalive comments
+            if (!trimmed || trimmed.startsWith(':')) continue // skip keepalives
 
-            // Parse "data: {...}" lines
-            const dataLine = trimmed.split('\n').find(l => l.startsWith('data: '))
+            // Find the data line
+            const lines = trimmed.split('\n')
+            const dataLine = lines.find(l => l.startsWith('data: '))
             if (!dataLine) continue
 
+            const jsonStr = dataLine.slice(6).trim()
+            if (!jsonStr) continue
+
             try {
-              const data = JSON.parse(dataLine.slice(6)) // strip "data: "
+              const data = JSON.parse(jsonStr)
+              console.log('[SSE]', data.event, data.agent || '')
+
               switch (data.event) {
-                case 'agent_start':      callbacks.onAgentStart?.(data.agent, data.label); break
-                case 'chunk':            callbacks.onChunk?.(data.agent, data.text); break
-                case 'result':           callbacks.onResult?.(data.agent, data.data); break
-                case 'agent_done':       callbacks.onAgentDone?.(data.agent); break
-                case 'error':            callbacks.onError?.(data.agent, data.message); break
-                case 'analysis_complete': callbacks.onComplete?.(); return
+                case 'agent_start':
+                  callbacks.onAgentStart?.(data.agent, data.label)
+                  break
+                case 'chunk':
+                  // Only show chunk in console, don't display raw JSON in UI
+                  callbacks.onChunk?.(data.agent, data.text)
+                  break
+                case 'result':
+                  console.log('[SSE] result data keys:', Object.keys(data.data || {}))
+                  callbacks.onResult?.(data.agent, data.data)
+                  break
+                case 'agent_done':
+                  callbacks.onAgentDone?.(data.agent)
+                  break
+                case 'error':
+                  callbacks.onError?.(data.agent, data.message)
+                  break
+                case 'analysis_complete':
+                  callbacks.onComplete?.()
+                  return
               }
             } catch (parseErr) {
-              console.warn('SSE parse error:', parseErr, 'raw:', dataLine)
+              console.warn('[SSE] parse error:', parseErr.message, 'raw:', jsonStr.slice(0, 100))
             }
           }
         }
 
-        // Stream ended without analysis_complete — treat as complete
         if (!cancelled) callbacks.onComplete?.()
 
       } catch (err) {
         if (!cancelled) {
-          console.error('Stream fetch error:', err)
+          console.error('[SSE] fetch error:', err)
           callbacks.onError?.('stream', err.message || 'Connection failed')
         }
       }
     }
 
     run()
-
-    // Return cancel function
     return () => { cancelled = true }
   }
 }
