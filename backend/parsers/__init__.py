@@ -390,7 +390,13 @@ def parse_asset(filename: str, content: str) -> ParsedAsset:
 # ── Load pre-loaded assets from disk ─────────────────────────────────────────
 
 def load_preloaded_assets() -> list[ParsedAsset]:
-    assets_dir = Path(__file__).parent.parent / "assets"
+    # Support both local dev and Docker (/app is the WORKDIR in container)
+    candidates = [
+        Path(__file__).parent.parent / "assets",   # local: backend/parsers/../assets
+        Path("/app/assets"),                         # Docker: /app/assets
+        Path(__file__).parent / "assets",            # fallback
+    ]
+    assets_dir = next((p for p in candidates if p.exists()), candidates[0])
     results = []
     for path in sorted(assets_dir.iterdir()):
         if path.is_file() and not path.name.startswith("."):

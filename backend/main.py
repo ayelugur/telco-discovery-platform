@@ -29,6 +29,8 @@ preloaded_assets: list[ParsedAsset] = []
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global preloaded_assets, state
+    print(f"[startup] Working directory: {Path.cwd()}")
+    print(f"[startup] __file__: {Path(__file__).resolve()}")
     print("[startup] Loading pre-built telco assets...")
     preloaded_assets = load_preloaded_assets()
     state.assets = preloaded_assets.copy()
