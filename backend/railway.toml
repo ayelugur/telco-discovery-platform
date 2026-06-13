@@ -4,3 +4,6 @@ dockerfilePath = "Dockerfile"
 
 [deploy]
 restartPolicyType = "ON_FAILURE"
+
+[[services]]
+timeout = 300
